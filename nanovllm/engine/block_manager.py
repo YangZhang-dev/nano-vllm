@@ -28,7 +28,11 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        # 维护一个hash到block_id的映射，用于根据token_ids快速找到对应的block_id
+
         self.hash_to_block_id: dict[int, int] = dict()
+        # 由于hash_to_block_id 这个hashset没有删除，所以维护一个set记录哪些块正在使用
+        # 在deallocated时，我们不立即释放一个块内的内容，也不立即清除hash_to_block_id，为了能够更大限度的复用block
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 

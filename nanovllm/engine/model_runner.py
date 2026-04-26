@@ -23,6 +23,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 创建TP Worker进程，并传入对应的rank和事件列表（rank 0向共享内存写入数据，使用event唤醒其他worker，所以rank传入的时所有worker）
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -136,6 +137,13 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            # 为Flash Attention准备输入，
+            # input_ids和positions是当前batch中所有序列的输入id和位置id拼接在一起的，
+            # cu_seqlens_q和cu_seqlens_k是前缀和，表示每个序列在拼接后的input_ids中的起始位置，
+            # max_seqlen_q和max_seqlen_k是这个batch中query和key的最大长度，
+            # block_table是每个序列的块表，表示每个块在原始序列中的位置，在schedule就分配好了。这个用于读，精确到块
+            # slot_mapping是每个token对应的kv_cache槽位，也就是物理详细地址，实际是可以通过blocktable计算得到的，这里提前算好。这个用于Flash Atten 写，精确到token
+
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
@@ -159,6 +167,10 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+        
+        # 如果K比Q长，说明该组prefill 请求中，有请求存在前缀缓存，所以要传入block table
+        # 所以从这里能看出来，如果单纯的做prefill并且没有前缀缓存，在Flash atten中是无需读取block tables的
+        # 需要准备block_tables传给Flash Attention，block_tables的shape是(batch_size, num_blocks)，每个元素是这个块在原始序列中的位置，如果块不存在则填-1
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -178,6 +190,8 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+            # 每个seq的slot mapping只有一个token
+
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -197,6 +211,8 @@ class ModelRunner:
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # 不重新走完整 Python forward 调度，而是重放之前录好的 GPU 操作。
+
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]

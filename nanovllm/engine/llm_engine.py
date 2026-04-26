@@ -44,6 +44,7 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        # 默认所有请求在初始时都是waiting状态
         self.scheduler.add(seq)
 
     def step(self):

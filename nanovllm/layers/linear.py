@@ -59,10 +59,14 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
+        # 这里列切分的tp_dim是0，因为pytorch线性层的weight是output_size x input_size的，所以切分output_size维度
+
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # 根据TP Rank的大小，将权重中对应的部分加载到当前参数中
+
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
@@ -112,6 +116,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+        # 确定qkv在参数大矩阵中的位置，将qkv放在一个矩阵中，shard_offset就是qkv矩阵的偏移量
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
@@ -124,6 +129,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        # 确定传入的参数在加载的权重中的位置，loaded_shard_id就是qkv中的一个，loaded_weight是这个shard_id对应的权重矩阵，先切分成tp_size份，再根据tp_rank取出当前进程需要加载的部分
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 

@@ -29,15 +29,21 @@ class Qwen3Attention(nn.Module):
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
+        # 计算在tp下，Q Head的数量
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
+        # 计算在tp下，KV Head的数量
         self.num_kv_heads = self.total_num_kv_heads // tp_size
+        # QKV单个头的维度
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        # Q * K^T 的缩放因子 根号下d_k
+        self.scaling = self.head_dim ** -0.5 
         self.qkv_bias = qkv_bias
+
+        # QKV 矩阵合并成一个大矩阵，TP采用列切分，正好按照注意力头的维度切分并行
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -46,6 +52,8 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # 输出投影矩阵，行切分，切分后每个进程负责输出hidden_size/tp_size维度的结果，最后在tp组All-Reduce拼接成完整的输出
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -97,6 +105,8 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
+        # SwiGLU 结构的MLP，gate_up_proj输出两倍的intermediate_size，一半作为gate，一半作为up，最后经过SiluAndMul激活函数后再下投影回hidden_size
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
