@@ -1,9 +1,7 @@
 from collections import deque
-
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
-
 
 class Scheduler:
 
@@ -50,7 +48,7 @@ class Scheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
-
+        # 有prefill请求，就不会处理decode请求
         if scheduled_seqs:
             return scheduled_seqs, True
 
@@ -87,6 +85,7 @@ class Scheduler:
                 continue
             # 如果chunked prefill结束或者一个decode结束，append token
             seq.append_token(token_id)
+            # 如果开启了eos并且输出了eos，或者到达了最大输出长度，就结束这个请求
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
