@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     from nanovllm import LLM
+    from nanovllm.engine.scheduled_batch import ScheduledBatch, StepMetrics
 
 
 @dataclass
@@ -29,6 +30,12 @@ class LatencyObserver:
     decode_time: float = 0.0
     last_decode_start: float | None = None
     last_decode_interval: float = 0.0
+    scheduled_tokens_by_step: list[int] = field(default_factory=list)
+    preemptions: int = 0
+    num_steps: int = 0
+    prefill_steps: int = 0
+    decode_steps: int = 0
+    mixed_steps: int = 0
 
     def add_request(self, seq_id: int, max_tokens: int, queue_enter_time: float):
         self.queue_enter_time[seq_id] = queue_enter_time
@@ -36,28 +43,38 @@ class LatencyObserver:
 
     def observe_step(
         self,
-        seqs,
-        is_prefill: bool,
-        num_tokens: int,
+        scheduled_batch: "ScheduledBatch",
+        metrics: "StepMetrics",
         schedule_time: float,
-        prefill_start_time: float,
+        run_start_time: float,
         step_end: float,
     ):
-        step_time = step_end - prefill_start_time
-        if is_prefill:
-            self.prefill_tokens += num_tokens
-            self.prefill_time += step_time
+        step_time = step_end - run_start_time
+        self.num_steps += 1
+        self.preemptions += metrics.preemptions
+        self.scheduled_tokens_by_step.append(metrics.num_scheduled_tokens)
+        if metrics.is_mixed:
+            self.mixed_steps += 1
+        elif metrics.is_prefill:
+            self.prefill_steps += 1
         else:
-            self.decode_tokens += len(seqs)
+            self.decode_steps += 1
+
+        if metrics.prefill_tokens:
+            self.prefill_tokens += metrics.prefill_tokens
+            self.prefill_time += step_time
+        if metrics.decode_tokens:
+            self.decode_tokens += metrics.decode_tokens
             self.decode_time += step_time
             if self.last_decode_start is not None:
-                self.last_decode_interval = prefill_start_time - self.last_decode_start
-            self.last_decode_start = prefill_start_time
+                self.last_decode_interval = run_start_time - self.last_decode_start
+            self.last_decode_start = run_start_time
 
-        for seq in seqs:
-            if is_prefill and seq.seq_id not in self.schedule_time:
+        for item in scheduled_batch.items:
+            seq = item.seq
+            if item.kind == "prefill" and seq.seq_id not in self.schedule_time:
                 self.schedule_time[seq.seq_id] = schedule_time
-                self.prefill_start_time[seq.seq_id] = prefill_start_time
+                self.prefill_start_time[seq.seq_id] = run_start_time
             if seq.num_completion_tokens >= 1 and seq.seq_id not in self.first_token_time:
                 self.first_token_time[seq.seq_id] = step_end
             if seq.is_finished:
@@ -122,17 +139,20 @@ def summarize_ms(name: str, values: list[float], per_token: bool = False):
 
 
 def timed_step(llm: LLM, observer: LatencyObserver):
+    from nanovllm.engine.scheduled_batch import ScheduledBatch, StepMetrics
+
     schedule_time = time.perf_counter()
     seqs, is_prefill = llm.scheduler.schedule()
-    num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+    scheduled_batch = ScheduledBatch.from_legacy(seqs, is_prefill)
 
-    prefill_start_time = time.perf_counter()
+    run_start_time = time.perf_counter()
     token_ids = llm.model_runner.call("run", seqs, is_prefill)
     llm.scheduler.postprocess(seqs, token_ids, is_prefill)
     step_end = time.perf_counter()
 
-    observer.observe_step(seqs, is_prefill, abs(num_tokens), schedule_time, prefill_start_time, step_end)
-    return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished], num_tokens
+    metrics = StepMetrics.from_batch(scheduled_batch, llm.scheduler.last_step_preemptions)
+    observer.observe_step(scheduled_batch, metrics, schedule_time, run_start_time, step_end)
+    return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished], metrics.legacy_token_count
 
 
 def parse_request_rate(value: str) -> float:
@@ -226,8 +246,8 @@ def main():
         elapsed = now - start
         while next_request < args.num_seqs and arrival_offsets[next_request] <= elapsed:
             scheduled_arrival = start + arrival_offsets[next_request]
-            llm.add_request(prompt_token_ids[next_request], sampling_params[next_request])
-            observer.add_request(llm.scheduler.waiting[-1].seq_id, sampling_params[next_request].max_tokens, scheduled_arrival)
+            seq_id = llm.add_request(prompt_token_ids[next_request], sampling_params[next_request])
+            observer.add_request(seq_id, sampling_params[next_request].max_tokens, scheduled_arrival)
             next_request += 1
 
         if llm.is_finished():
@@ -261,6 +281,22 @@ def main():
     print(f"Generated tokens: {total_tokens}")
     print(f"Elapsed time: {total_time:.2f} s")
     print(f"Completed rate: {args.num_seqs / total_time:.2f} req/s")
+    print(f"Output throughput: {total_tokens / total_time:.2f} tok/s")
+    if observer.prefill_time:
+        print(f"Prefill throughput: {observer.prefill_tokens / observer.prefill_time:.2f} tok/s")
+    if observer.decode_time:
+        print(f"Decode throughput: {observer.decode_tokens / observer.decode_time:.2f} tok/s")
+    if observer.scheduled_tokens_by_step:
+        avg_scheduled_tokens = sum(observer.scheduled_tokens_by_step) / len(observer.scheduled_tokens_by_step)
+        print(f"Average scheduled tokens/step: {avg_scheduled_tokens:.2f}")
+    print(f"Preemptions: {observer.preemptions}")
+    print(
+        "Steps: "
+        f"total={observer.num_steps}, "
+        f"prefill={observer.prefill_steps}, "
+        f"decode={observer.decode_steps}, "
+        f"mixed={observer.mixed_steps}"
+    )
     print()
     summarize_ms("TTFT", observer.ttft())
     print()

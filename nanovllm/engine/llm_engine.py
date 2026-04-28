@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.scheduled_batch import ScheduledBatch, StepMetrics, StepOutput
 
 
 class LLMEngine:
@@ -46,14 +47,16 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         # 默认所有请求在初始时都是waiting状态
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        scheduled_batch = ScheduledBatch.from_legacy(seqs, is_prefill)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens,seqs
+        metrics = StepMetrics.from_batch(scheduled_batch, self.scheduler.last_step_preemptions)
+        return StepOutput(outputs, metrics, scheduled_batch)
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -73,7 +76,9 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens,seqs = self.step()
+            result = self.step()
+            output = result.outputs
+            num_tokens = result.num_tokens
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
